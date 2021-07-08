@@ -1,0 +1,126 @@
+--Create a table with a single text column to house all the concatenated strings
+CREATE TABLE excel(
+    textjoin text
+    );
+
+--populate the table with concatenated strings from the .csv file
+COPY excel
+FROM 'D:\path\filename.csv'
+CSV;
+
+--Final analytical table
+CREATE TABLE zillow_weekly_median_listprice(
+region TEXT,
+median_listprice TEXT,
+week_date DATE);
+
+--Table in which text strings will be pivoted
+--rownumber will be blank initially, but we will need it in order to define functions later
+CREATE TABLE staging(
+region TEXT,
+median_listprice TEXT,
+rownumber INT);
+
+--Table of range of dates in dataset
+CREATE TABLE zillow_weekly_median_listprice_date_range AS
+SELECT * 
+FROM generate_series('10-14-2017'::DATE, '5-29-2021'::DATE, '7 day'::INTERVAL) AS week_date;
+
+--add an autoincrement column, which we will use later to merge the dates onto the pivoted table
+ALTER TABLE zillow_weekly_median_listprice_date_range
+ADD rownumber SERIAL;
+
+--Function takes one parameter, an individual concatenated string
+CREATE OR REPLACE FUNCTION pivot_string(textjoin_string TEXT)
+RETURNS void AS
+$$
+--This part of the code splits the concatenated string into chunks separated by the string SPACE
+--with each chunk becoming a row in the column median_listprice of the table staging
+INSERT INTO staging(median_listprice)
+SELECT REGEXP_SPLIT_TO_TABLE($1, 'SPACE');
+
+--The first row of the column median_listprice is the region name
+--so we should set the region column, which is currently blank, as that value
+UPDATE staging
+SET region = (SELECT median_listprice FROM staging LIMIT 1);
+
+
+--Now let's delete the first row of the table, so we're left with a populated region_name column
+--and a populated median_listprice column
+DELETE FROM staging
+WHERE median_listprice = (SELECT DISTINCT region FROM staging);
+
+
+--The rownumber column in the table definition is just a placeholder so that the next function can be created
+--In this function, we'll replace that column with an auto-increment column, that we can use to merge this table
+--with the date range table we created earlier
+ALTER TABLE staging
+DROP rownumber;
+
+ALTER TABLE staging
+ADD rownumber SERIAL;
+
+$$
+LANGUAGE SQL VOLATILE;
+
+--This function takes no inputs, and merges the staging table, populated using the previous function,
+--with the date range table we created earlier, before using the result to populate the final table
+CREATE OR REPLACE FUNCTION populate_final()
+RETURNS void AS
+$$
+--merges the staging table and date range, then populates final table
+INSERT INTO zillow_weekly_median_listprice(region, median_listprice, week_date)
+SELECT 
+s.region AS region,
+s.median_listprice AS median_listprice,
+w.week_date AS week_date
+FROM staging s, zillow_weekly_median_listprice_date_range w
+WHERE s.rownumber = w.rownumber;
+
+
+--deletes data from staging table, so that it can be repopulated 
+--with the next concatenated string
+DELETE FROM staging;
+
+$$
+LANGUAGE SQL VOLATILE;
+
+
+--Iteratively passes each concatenated string from the excel table
+--into the 2 previously created functions, resulting in a
+--populated final table
+CREATE OR REPLACE FUNCTION convert_textjoins()
+RETURNS void AS
+$$
+--declare the variable r, representing a row of the excel table, as a text variable
+DECLARE
+r text;
+BEGIN
+    --iterate through each row of the excel table, performing the previously created functions
+    FOR r IN 
+        SELECT * FROM excel
+    LOOP
+        PERFORM pivot_string(r);
+        PERFORM populate_final();
+    END LOOP;
+END;
+$$
+LANGUAGE plpgsql VOLATILE;
+
+--Execute last function
+SELECT convert_textjoins();
+
+--Delete empty spaces from median_listprice column
+UPDATE zillow_weekly_median_listprice
+SET median_listprice = REPLACE(median_listprice, ' ', '');
+
+--Convert rows of median_listprice, that currently contain empty strings, into null
+UPDATE zillow_weekly_median_listprice
+SET median_listprice = NULL
+WHERE LENGTH(median_listprice) = 0;
+
+--Cast column as integer datatype
+ALTER TABLE zillow_weekly_median_listprice
+ALTER COLUMN median_listprice TYPE INT
+USING median_listprice::INT;
+
